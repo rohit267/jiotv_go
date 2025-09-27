@@ -103,7 +103,10 @@ func isCustomChannel(channelID string) bool {
 // IndexHandler handles the index page for `/` route
 func IndexHandler(c *fiber.Ctx) error {
 	// Get all channels
-	channels := television.Channels()
+	channels, err := television.Channels()
+	if err != nil {
+		return ErrorMessageHandler(c, err)
+	}
 
 	// Get language and category from query params
 	language := c.Query("language")
@@ -207,12 +210,27 @@ func LiveHandler(c *fiber.Ctx) error {
 	}
 	// quote url as it will be passed as a query parameter
 	// It is required to quote the url as it may contain special characters like ? and &
-	coded_url, err := secureurl.EncryptURL(liveResult.Bitrates.Auto)
+	// Ensure hdnea from Live is appended to subsequent requests
+	liveURL := liveResult.Bitrates.Auto
+	if liveResult.Hdnea != "" && !strings.Contains(liveURL, "hdnea=") {
+		sep := "?"
+		if strings.Contains(liveURL, "?") {
+			sep = "&"
+		}
+		liveURL = liveURL + sep + "hdnea=" + liveResult.Hdnea
+	}
+
+	coded_url, err := secureurl.EncryptURL(liveURL)
 	if err != nil {
 		utils.Log.Println(err)
 		return internalUtils.ForbiddenError(c, err)
 	}
-	return c.Redirect("/render.m3u8?auth="+coded_url+"&channel_key_id="+id, fiber.StatusFound)
+	// also add hdnea as an explicit query param for downstream (no client cookie)
+	redirectURL := "/render.m3u8?auth=" + coded_url + "&channel_key_id=" + id
+	if liveResult.Hdnea != "" {
+		redirectURL += "&hdnea=" + liveResult.Hdnea
+	}
+	return c.Redirect(redirectURL, fiber.StatusFound)
 }
 
 // LiveQualityHandler handles the live channel stream route `/live/:quality/:id.m3u8`.
@@ -252,17 +270,28 @@ func LiveQualityHandler(c *fiber.Ctx) error {
 	if id == "1349" || id == "1322" {
 		quality = "auto"
 	}
-	
+
 	// select quality level based on query parameter
 	liveURL := internalUtils.SelectQuality(quality, Bitrates.Auto, Bitrates.High, Bitrates.Medium, Bitrates.Low)
-	
+	if liveResult.Hdnea != "" && !strings.Contains(liveURL, "hdnea=") {
+		sep := "?"
+		if strings.Contains(liveURL, "?") {
+			sep = "&"
+		}
+		liveURL = liveURL + sep + "hdnea=" + liveResult.Hdnea
+	}
+
 	// quote url as it will be passed as a query parameter
 	coded_url, err := secureurl.EncryptURL(liveURL)
 	if err != nil {
 		utils.Log.Println(err)
 		return internalUtils.ForbiddenError(c, err)
 	}
-	return c.Redirect("/render.m3u8?auth="+coded_url+"&channel_key_id="+id, fiber.StatusFound)
+	redirectURL := "/render.m3u8?auth=" + coded_url + "&channel_key_id=" + id + "&q=" + quality
+	if liveResult.Hdnea != "" {
+		redirectURL += "&hdnea=" + liveResult.Hdnea
+	}
+	return c.Redirect(redirectURL, fiber.StatusFound)
 }
 
 // RenderHandler handles M3U8 file for modification
@@ -285,18 +314,31 @@ func RenderHandler(c *fiber.Ctx) error {
 		return err
 	}
 
-	renderResult, statusCode := TV.Render(decoded_url)
+	// If hdnea is present in query and missing in the decrypted URL, append it so TV.Render can forward as request cookie upstream
+	if hdnea := c.Query("hdnea"); hdnea != "" && !strings.Contains(decoded_url, "hdnea=") {
+		sep := "?"
+		if strings.Contains(decoded_url, "?") {
+			sep = "&"
+		}
+		decoded_url = decoded_url + sep + "hdnea=" + hdnea
+	}
+
+	renderResult, statusCode, newHdnea := TV.Render(decoded_url)
 
 	// If we get a 403 (Forbidden), try refreshing tokens and retry once
 	if statusCode == fiber.StatusForbidden {
 		if err := EnsureFreshTokens(); err != nil {
 			utils.Log.Printf("Failed to refresh tokens after 403: %v", err)
-		} else {
 			// Retry the request once after refreshing tokens
 			utils.Log.Println("Retrying render request after token refresh")
-			renderResult, statusCode = TV.Render(decoded_url)
+			renderResult, statusCode, newHdnea = TV.Render(decoded_url)
+		} else {
+			utils.Log.Println("Unable to refresh tokens after expiration")
+			return internalUtils.ForbiddenError(c, "Access forbidden. Something went wrong!")
 		}
 	}
+	// No client cookie: if upstream rotated __hdnea__, we'll embed the fresh token into rewritten URLs below
+
 	// baseUrl is the part of the url excluding suffix file.m3u8 and params is the part of the url after the suffix
 	split_url_by_params := strings.Split(decoded_url, "?")
 	baseStringUrl := split_url_by_params[0]
@@ -306,13 +348,32 @@ func RenderHandler(c *fiber.Ctx) error {
 	// Add baseUrl to all the file names ending with .m3u8
 	baseUrl := []byte(re.ReplaceAllString(baseStringUrl, ""))
 	params := split_url_by_params[1]
+	// If upstream rotated __hdnea__, update params so rewritten URLs carry the fresh token value
+	if newHdnea != "" {
+		if strings.Contains(params, "hdnea=") {
+			parts := strings.Split(params, "&")
+			for i, p := range parts {
+				if strings.HasPrefix(p, "hdnea=") {
+					parts[i] = "hdnea=" + newHdnea
+					break
+				}
+			}
+			params = strings.Join(parts, "&")
+		} else {
+			if params == "" {
+				params = "hdnea=" + newHdnea
+			} else {
+				params = params + "&hdnea=" + newHdnea
+			}
+		}
+	}
 
 	// replacer replaces all the file names ending with .m3u8 and .ts with our own server URLs
 	// More info: https://golang.org/pkg/regexp/#Regexp.ReplaceAllFunc
 	replacer := func(match []byte) []byte {
 		switch {
 		case bytes.HasSuffix(match, []byte(".m3u8")):
-			return television.ReplaceM3U8(baseUrl, match, params, channel_id)
+			return television.ReplaceM3U8(baseUrl, match, params, channel_id, c.Query("q"))
 		case bytes.HasSuffix(match, []byte(".ts")):
 			return television.ReplaceTS(baseUrl, match, params)
 		case bytes.HasSuffix(match, []byte(".aac")):
@@ -375,6 +436,10 @@ func SLHandler(c *fiber.Ctx) error {
 func RenderKeyHandler(c *fiber.Ctx) error {
 	channel_id := c.Query("channel_key_id")
 	auth := c.Query("auth")
+	// parse incoming hdnea query and set as request cookie only for upstream call (no client cookie)
+	if hdnea := c.Query("hdnea"); hdnea != "" {
+		c.Request().Header.SetCookie("__hdnea__", hdnea)
+	}
 	// decode url
 	decoded_url, err := internalUtils.DecryptURLParam("auth", auth)
 	if err != nil {
@@ -389,6 +454,15 @@ func RenderKeyHandler(c *fiber.Ctx) error {
 		key := strings.Split(param, "=")[0]
 		value := strings.Split(param, "=")[1]
 		c.Request().Header.SetCookie(key, value)
+	}
+	// ensure __hdnea__ cookie exists if available from params
+	if strings.Contains(params, "hdnea=") {
+		for _, p := range strings.Split(params, "&") {
+			if strings.HasPrefix(p, "hdnea=") {
+				c.Request().Header.SetCookie("__hdnea__", strings.TrimPrefix(p, "hdnea="))
+				break
+			}
+		}
 	}
 
 	// Copy headers from the Television headers map to the request
@@ -409,6 +483,10 @@ func RenderKeyHandler(c *fiber.Ctx) error {
 // RenderTSHandler loads TS file from JioTV server
 func RenderTSHandler(c *fiber.Ctx) error {
 	auth := c.Query("auth")
+	// parse incoming hdnea query and set as request cookie only for upstream call (no client cookie)
+	if hdnea := c.Query("hdnea"); hdnea != "" {
+		c.Request().Header.SetCookie("__hdnea__", hdnea)
+	}
 	// decode url
 	decoded_url, err := internalUtils.DecryptURLParam("auth", auth)
 	if err != nil {
@@ -426,7 +504,10 @@ func ChannelsHandler(c *fiber.Ctx) error {
 	splitCategory := strings.TrimSpace(c.Query("c"))
 	languages := strings.TrimSpace(c.Query("l"))
 	skipGenres := strings.TrimSpace(c.Query("sg"))
-	apiResponse := television.Channels()
+	apiResponse, err := television.Channels()
+	if err != nil {
+		return ErrorMessageHandler(c, err)
+	}
 	// hostUrl should be request URL like http://localhost:5001
 	hostURL := strings.ToLower(c.Protocol()) + "://" + c.Hostname()
 
